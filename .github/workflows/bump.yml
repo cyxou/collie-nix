@@ -48,39 +48,61 @@ jobs:
 
       - name: Decide whether to publish
         id: plan
+        env:
+          CHANGED: ${{ steps.bump.outputs.changed }}
         run: |
-          if [ "${{ github.event_name }}" = push ] || [ "${{ steps.bump.outputs.changed }}" = true ]; then
-            echo "publish=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "publish=false" >>"$GITHUB_OUTPUT"
+          build=false
+          if [ "$GITHUB_EVENT_NAME" = push ] || [ "$CHANGED" = true ]; then
+            build=true
           fi
-          echo "version=$(jq -r .version sources.json)" >>"$GITHUB_OUTPUT"
+          # Only master commits or publishes: a dispatch from another branch is
+          # a dry run (bump + build), never a push of that branch to master.
+          publish=false
+          if [ "$build" = true ] && [ "$GITHUB_REF" = refs/heads/master ]; then
+            publish=true
+          fi
+          {
+            echo "build=$build"
+            echo "publish=$publish"
+            echo "version=$(jq -r .version sources.json)"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Build collie
-        if: steps.plan.outputs.publish == 'true'
+        if: steps.plan.outputs.build == 'true'
         run: nix build .#collie -o collie && ./collie/bin/collie --version
 
       - name: Build the lead image
-        if: steps.plan.outputs.publish == 'true'
+        if: steps.plan.outputs.build == 'true'
         run: nix build .#lead-image -o image
 
-      - name: Commit and tag the bump
-        if: steps.bump.outputs.changed == 'true'
+      # Image before commit: a failed push leaves master unbumped, so the next
+      # run retries the whole release (re-pushing a tag is idempotent). The
+      # other order strands the version, since later runs see "already latest".
+      - name: Push the lead image
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          v="${{ steps.plan.outputs.version }}"
+          v="$VERSION"
+          for tag in "$v" latest; do
+            # --insecure-policy: nixpkgs' skopeo ships no default policy.json,
+            # and the source is a local, hash-pinned Nix output.
+            nix shell --inputs-from . nixpkgs#skopeo -c \
+              skopeo --insecure-policy copy \
+                --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" \
+                docker-archive:image "docker://${IMAGE}:${tag}"
+          done
+
+      - name: Commit and tag the bump
+        if: steps.plan.outputs.publish == 'true' && steps.bump.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          v="$VERSION"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore: collie $v" sources.json
           git tag "v$v"
-          git push origin HEAD:master "v$v"
-
-      - name: Push the lead image
-        if: steps.plan.outputs.publish == 'true'
-        run: |
-          v="${{ steps.plan.outputs.version }}"
-          for tag in "$v" latest; do
-            nix shell --inputs-from . nixpkgs#skopeo -c \
-              skopeo copy \
-                --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-                docker-archive:image "docker://${IMAGE}:${tag}"
-          done
+          # --atomic: if master moved on, the tag must not land without it.
+          git push --atomic origin HEAD:master "v$v"
