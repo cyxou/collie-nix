@@ -1,0 +1,86 @@
+# Track every upstream collie release: bump sources.json, build (collie's
+# --version installCheck gates the release), commit + tag, push the lead image.
+# Commits pushed with GITHUB_TOKEN do not trigger workflows, so the bot's own
+# bump commit does not re-run this through the `push` trigger.
+name: bump
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+  # Recipe or hand edits on master republish the image for the current version.
+  push:
+    branches: [master]
+    paths:
+      - "pkgs/**"
+      - "flake.nix"
+      - "flake.lock"
+      - "sources.json"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: bump
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/cyxou/collie-lead
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Test the bump script
+        run: tests/bump.test.sh
+
+      - name: Check for a new collie release
+        id: bump
+        if: github.event_name != 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/bump.sh
+
+      - name: Decide whether to publish
+        id: plan
+        run: |
+          if [ "${{ github.event_name }}" = push ] || [ "${{ steps.bump.outputs.changed }}" = true ]; then
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+          fi
+          echo "version=$(jq -r .version sources.json)" >>"$GITHUB_OUTPUT"
+
+      - name: Build collie
+        if: steps.plan.outputs.publish == 'true'
+        run: nix build .#collie -o collie && ./collie/bin/collie --version
+
+      - name: Build the lead image
+        if: steps.plan.outputs.publish == 'true'
+        run: nix build .#lead-image -o image
+
+      - name: Commit and tag the bump
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          v="${{ steps.plan.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: collie $v" sources.json
+          git tag "v$v"
+          git push origin HEAD:master "v$v"
+
+      - name: Push the lead image
+        if: steps.plan.outputs.publish == 'true'
+        run: |
+          v="${{ steps.plan.outputs.version }}"
+          for tag in "$v" latest; do
+            nix shell --inputs-from . nixpkgs#skopeo -c \
+              skopeo copy \
+                --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+                docker-archive:image "docker://${IMAGE}:${tag}"
+          done
